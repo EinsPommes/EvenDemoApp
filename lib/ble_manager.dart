@@ -4,11 +4,44 @@ import 'package:demo_ai_even/services/ble.dart';
 import 'package:demo_ai_even/services/evenai.dart';
 import 'package:demo_ai_even/services/proto.dart';
 import 'package:flutter/services.dart';
+import 'package:fluttertoast/fluttertoast.dart';
 
 typedef SendResultParse = bool Function(Uint8List value);
 
+// connection states for better tracking
+enum BleConnectionState {
+  disconnected,
+  scanning,
+  connecting,
+  connected,
+  reconnecting,
+  error
+}
+
+// different error types we might encounter
+enum BleErrorType {
+  timeout,
+  connectionLost,
+  deviceNotFound,
+  permissionDenied,
+  bluetoothOff,
+  unknown
+}
+
+class BleError {
+  final BleErrorType type;
+  final String message;
+  final dynamic originalError;
+  
+  BleError(this.type, this.message, [this.originalError]);
+  
+  @override
+  String toString() => 'BleError($type): $message';
+}
+
 class BleManager {
   Function()? onStatusChanged;
+  Function(BleError)? onError;
   BleManager._() {}
 
   static BleManager? _instance;
@@ -29,41 +62,78 @@ class BleManager {
       .map((ret) => BleReceive.fromMap(ret));
 
   Timer? beatHeartTimer;
+  Timer? reconnectionTimer;
   
   final List<Map<String, String>> pairedGlasses = [];
   bool isConnected = false;
   String connectionStatus = 'Not connected';
+  BleConnectionState _connectionState = BleConnectionState.disconnected;
+  
+  // reconnection stuff
+  int _reconnectionAttempts = 0;
+  static const int maxReconnectionAttempts = 5;
+  static const int reconnectionDelaySeconds = 3;
+  
+  // track connection issues
+  DateTime? _lastSuccessfulConnection;
+  int _consecutiveFailures = 0;
+  
+  BleConnectionState get connectionState => _connectionState;
 
   void _init() {}
 
   void startListening() {
-    eventBleReceive.listen((res) {
-      _handleReceivedData(res);
-    });
+    eventBleReceive.listen(
+      (res) {
+        try {
+          _handleReceivedData(res);
+        } catch (e, stackTrace) {
+          _handleError(BleError(BleErrorType.unknown, 
+            'Error processing received data: $e', e));
+          print('Error in startListening: $e\n$stackTrace');
+        }
+      },
+      onError: (error) {
+        _handleError(BleError(BleErrorType.unknown, 
+          'Stream error: $error', error));
+      },
+    );
   }
 
   Future<void> startScan() async {
     try {
+      _updateConnectionState(BleConnectionState.scanning);
       await _channel.invokeMethod('startScan');
+      print('${DateTime.now()} BLE scan started successfully');
     } catch (e) {
-      print('Error starting scan: $e');
+      final error = BleError(BleErrorType.unknown, 'Error starting scan: $e', e);
+      _handleError(error);
+      _updateConnectionState(BleConnectionState.error);
     }
   }
 
   Future<void> stopScan() async {
     try {
       await _channel.invokeMethod('stopScan');
+      print('${DateTime.now()} BLE scan stopped successfully');
     } catch (e) {
-      print('Error stopping scan: $e');
+      final error = BleError(BleErrorType.unknown, 'Error stopping scan: $e', e);
+      _handleError(error);
     }
   }
 
   Future<void> connectToGlasses(String deviceName) async {
     try {
+      _updateConnectionState(BleConnectionState.connecting);
       await _channel.invokeMethod('connectToGlasses', {'deviceName': deviceName});
       connectionStatus = 'Connecting...';
+      _resetConnectionTracking();
+      print('${DateTime.now()} Connecting to glasses: $deviceName');
     } catch (e) {
-      print('Error connecting to device: $e');
+      final error = BleError(BleErrorType.connectionLost, 
+        'Error connecting to device $deviceName: $e', e);
+      _handleError(error);
+      _updateConnectionState(BleConnectionState.error);
     }
   }
 
@@ -94,9 +164,21 @@ class BleManager {
     print("_onGlassesConnected----arguments----$arguments------");
     connectionStatus = 'Connected: \n${arguments['leftDeviceName']} \n${arguments['rightDeviceName']}';
     isConnected = true;
+    _updateConnectionState(BleConnectionState.connected);
+    
+    // reset counters on successful connection
+    _consecutiveFailures = 0;
+    _reconnectionAttempts = 0;
+    _lastSuccessfulConnection = DateTime.now();
+    
+    // stop trying to reconnect
+    reconnectionTimer?.cancel();
+    reconnectionTimer = null;
 
     onStatusChanged?.call();
     startSendBeatHeart();
+    
+    _showToast('Glasses connected successfully');
   }
 
   int tryTime = 0;
@@ -105,12 +187,40 @@ class BleManager {
     beatHeartTimer = null;
 
     beatHeartTimer = Timer.periodic(Duration(seconds: 8), (timer) async {
-      bool isSuccess = await Proto.sendHeartBeat();
-      if (!isSuccess && tryTime < 2) {
-        tryTime++;
-        await Proto.sendHeartBeat();
-      } else {
-        tryTime = 0;
+      try {
+        if (!isConnected) {
+          print('${DateTime.now()} Stopping heartbeat - not connected');
+          timer.cancel();
+          return;
+        }
+
+        bool isSuccess = await Proto.sendHeartBeat();
+        if (!isSuccess && tryTime < 2) {
+          tryTime++;
+          print('${DateTime.now()} Heartbeat failed, retry $tryTime');
+          isSuccess = await Proto.sendHeartBeat();
+        }
+        
+        if (!isSuccess) {
+          _consecutiveFailures++;
+          print('${DateTime.now()} Heartbeat failed after retries. Failures: $_consecutiveFailures');
+          
+          if (_consecutiveFailures >= 3) {
+            print('${DateTime.now()} Multiple heartbeat failures, triggering disconnection');
+            _onGlassesDisconnected();
+            timer.cancel();
+          }
+        } else {
+          // reset failure count when heartbeat works again
+          if (_consecutiveFailures > 0) {
+            print('${DateTime.now()} Heartbeat recovered, resetting failure count');
+            _consecutiveFailures = 0;
+          }
+          tryTime = 0;
+        }
+      } catch (e) {
+        print('${DateTime.now()} Error in heartbeat: $e');
+        _handleError(BleError(BleErrorType.unknown, 'Heartbeat error: $e', e));
       }
     });
   }
@@ -124,8 +234,27 @@ class BleManager {
   void _onGlassesDisconnected() {
     connectionStatus = 'Not connected';
     isConnected = false;
+    _updateConnectionState(BleConnectionState.disconnected);
+    
+    // count failures
+    _consecutiveFailures++;
+    
+    // stop heartbeat
+    beatHeartTimer?.cancel();
+    beatHeartTimer = null;
 
     onStatusChanged?.call();
+    
+    // try to reconnect if not too many failures
+    if (_consecutiveFailures <= maxReconnectionAttempts) {
+      _showToast('Connection lost. Attempting to reconnect...');
+      _attemptReconnection();
+    } else {
+      _showToast('Connection lost. Max reconnection attempts reached.');
+      final error = BleError(BleErrorType.connectionLost, 
+        'Maximum reconnection attempts reached');
+      _handleError(error);
+    }
   }
 
   void _onPairedGlassesFound(Map<String, String> deviceInfo) {
@@ -140,49 +269,89 @@ class BleManager {
   }
 
   void _handleReceivedData(BleReceive res) {
-    if (res.type == "VoiceChunk") {
-      return;
-    }
-
-    String cmd = "${res.lr}${res.getCmd().toRadixString(16).padLeft(2, '0')}";
-    if (res.getCmd() != 0xf1) {
-      print(
-        "${DateTime.now()} BleManager receive cmd: $cmd, len: ${res.data.length}, data = ${res.data.hexString}",
-      );
-    }
-
-    if (res.data[0].toInt() == 0xF5) {
-      final notifyIndex = res.data[1].toInt();
-      
-      switch (notifyIndex) {
-        case 0:
-          App.get.exitAll();
-          break;
-        case 1: 
-          if (res.lr == 'L') {
-            EvenAI.get.lastPageByTouchpad();
-          } else {
-            EvenAI.get.nextPageByTouchpad();
-          }
-          break;
-        case 23: //BleEvent.evenaiStart:
-          EvenAI.get.toStartEvenAIByOS();
-          break;
-        case 24: //BleEvent.evenaiRecordOver:
-          EvenAI.get.recordOverByOS();
-          break;
-        default:
-          print("Unknown Ble Event: $notifyIndex");
-      }
-      return;
-    }
-      _reqListen.remove(cmd)?.complete(res);
-      _reqTimeout.remove(cmd)?.cancel();
-      if (_nextReceive != null) {
-        _nextReceive?.complete(res);
-        _nextReceive = null;
+    try {
+      if (res.type == "VoiceChunk") {
+        return;
       }
 
+      // check if we got any data
+      if (res.data.isEmpty) {
+        print('${DateTime.now()} Warning: Received empty data');
+        return;
+      }
+
+      String cmd = "${res.lr}${res.getCmd().toRadixString(16).padLeft(2, '0')}";
+      if (res.getCmd() != 0xf1) {
+        print(
+          "${DateTime.now()} BleManager receive cmd: $cmd, len: ${res.data.length}, data = ${res.data.hexString}",
+        );
+      }
+
+      // Handle TouchBar events (0xF5)
+      if (res.data[0].toInt() == 0xF5) {
+        if (res.data.length < 2) {
+          print('${DateTime.now()} Warning: F5 command with insufficient data length');
+          return;
+        }
+        
+        final notifyIndex = res.data[1].toInt();
+        
+        switch (notifyIndex) {
+          case 0:
+            try {
+              App.get.exitAll();
+            } catch (e) {
+              print('${DateTime.now()} Error in exitAll: $e');
+            }
+            break;
+          case 1: 
+            try {
+              if (res.lr == 'L') {
+                EvenAI.get.lastPageByTouchpad();
+              } else {
+                EvenAI.get.nextPageByTouchpad();
+              }
+            } catch (e) {
+              print('${DateTime.now()} Error in page navigation: $e');
+            }
+            break;
+          case 23: //BleEvent.evenaiStart:
+            try {
+              EvenAI.get.toStartEvenAIByOS();
+            } catch (e) {
+              print('${DateTime.now()} Error starting EvenAI: $e');
+            }
+            break;
+          case 24: //BleEvent.evenaiRecordOver:
+            try {
+              EvenAI.get.recordOverByOS();
+            } catch (e) {
+              print('${DateTime.now()} Error in recordOver: $e');
+            }
+            break;
+          default:
+            print("${DateTime.now()} Unknown Ble Event: $notifyIndex");
+        }
+        return;
+      }
+
+      // complete the request
+      try {
+        _reqListen.remove(cmd)?.complete(res);
+        _reqTimeout.remove(cmd)?.cancel();
+        if (_nextReceive != null) {
+          _nextReceive?.complete(res);
+          _nextReceive = null;
+        }
+      } catch (e) {
+        print('${DateTime.now()} Error completing request: $e');
+      }
+
+    } catch (e, stackTrace) {
+      print('${DateTime.now()} Error in _handleReceivedData: $e\n$stackTrace');
+      _handleError(BleError(BleErrorType.unknown, 
+        'Error handling received data: $e', e));
+    }
   }
 
   String getConnectionStatus() {
@@ -228,20 +397,40 @@ class BleManager {
     int retry = 3,
   }) async {
     BleReceive ret;
+    
     for (var i = 0; i <= retry; i++) {
-      ret = await request(data,
-          lr: lr, other: other, timeoutMs: timeoutMs, useNext: useNext);
-      if (!ret.isTimeout) {
-        return ret;
-      }
-      if (!BleManager.isBothConnected()) {
-        break;
+      try {
+        ret = await request(data,
+            lr: lr, other: other, timeoutMs: timeoutMs, useNext: useNext);
+        if (!ret.isTimeout) {
+          return ret;
+        }
+        
+        // check if still connected before retrying
+        if (!BleManager.isBothConnected()) {
+          print('${DateTime.now()} Connection lost during requestRetry, aborting');
+          break;
+        }
+        
+        // wait a bit before retry
+        if (i < retry) {
+          await Future.delayed(Duration(milliseconds: 50 * (i + 1)));
+          print('${DateTime.now()} Retry attempt ${i + 1} for $lr');
+        }
+      } catch (e) {
+        print('${DateTime.now()} Error in requestRetry attempt $i: $e');
+        if (i == retry) {
+          // Last attempt failed, create timeout response
+          ret = BleReceive();
+          ret.isTimeout = true;
+          break;
+        }
       }
     }
+    
     ret = BleReceive();
     ret.isTimeout = true;
-    print(
-        "requestRetry $lr timeout of $timeoutMs");
+    print('${DateTime.now()} requestRetry $lr timeout after $retry attempts (${timeoutMs}ms each)');
     return ret;
   }
 
@@ -251,26 +440,57 @@ class BleManager {
     SendResultParse? isSuccess,
     int? retry,
   }) async {
+    try {
+      // make sure we're connected
+      if (!BleManager.isBothConnected()) {
+        print('${DateTime.now()} sendBoth failed: Not connected');
+        return false;
+      }
 
-    var ret = await BleManager.requestRetry(data,
-        lr: "L", timeoutMs: timeoutMs, retry: retry ?? 0);
-    if (ret.isTimeout) {
-      print("sendBoth L timeout");
+      // send to left first
+      var retL = await BleManager.requestRetry(data,
+          lr: "L", timeoutMs: timeoutMs, retry: retry ?? 0);
+      
+      if (retL.isTimeout) {
+        print('${DateTime.now()} sendBoth L timeout');
+        return false;
+      }
 
-      return false;
-    } else if (isSuccess != null) {
-      final success = isSuccess.call(ret.data);
-      if (!success) return false;
+      // check left response
+      bool leftSuccess = true;
+      if (isSuccess != null) {
+        leftSuccess = isSuccess.call(retL.data);
+        if (!leftSuccess) {
+          print('${DateTime.now()} sendBoth L validation failed');
+          return false;
+        }
+      } else if (retL.data.isNotEmpty && retL.data[1].toInt() != 0xc9) {
+        print('${DateTime.now()} sendBoth L response not successful: ${retL.data[1].toInt()}');
+        return false;
+      }
+
+      // send to right
       var retR = await BleManager.requestRetry(data,
           lr: "R", timeoutMs: timeoutMs, retry: retry ?? 0);
-      if (retR.isTimeout) return false;
-      return isSuccess.call(retR.data);
-    } else if (ret.data[1].toInt() == 0xc9) {
-      var ret = await BleManager.requestRetry(data,
-          lr: "R", timeoutMs: timeoutMs, retry: retry ?? 0);
-      if (ret.isTimeout) return false;
+      
+      if (retR.isTimeout) {
+        print('${DateTime.now()} sendBoth R timeout');
+        return false;
+      }
+
+      // check right response
+      if (isSuccess != null) {
+        return isSuccess.call(retR.data);
+      } else if (retR.data.isNotEmpty && retR.data[1].toInt() != 0xc9) {
+        print('${DateTime.now()} sendBoth R response not successful: ${retR.data[1].toInt()}');
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      print('${DateTime.now()} Error in sendBoth: $e');
+      return false;
     }
-    return true;
   }
 
   static Future sendData(Uint8List data,
@@ -358,6 +578,86 @@ class BleManager {
 
     // todo
     return true;
+  }
+
+  // helper methods for connection handling
+  void _updateConnectionState(BleConnectionState newState) {
+    if (_connectionState != newState) {
+      print('${DateTime.now()} BLE State changed: $_connectionState -> $newState');
+      _connectionState = newState;
+    }
+  }
+
+  void _handleError(BleError error) {
+    print('${DateTime.now()} BLE Error: $error');
+    onError?.call(error);
+    
+    // show user friendly messages
+    switch (error.type) {
+      case BleErrorType.timeout:
+        _showToast('Connection timeout. Please try again.');
+        break;
+      case BleErrorType.connectionLost:
+        _showToast('Connection lost. Reconnecting...');
+        break;
+      case BleErrorType.deviceNotFound:
+        _showToast('Device not found. Please check if glasses are on.');
+        break;
+      case BleErrorType.bluetoothOff:
+        _showToast('Please enable Bluetooth.');
+        break;
+      default:
+        _showToast('Connection error occurred.');
+    }
+  }
+
+  void _resetConnectionTracking() {
+    _consecutiveFailures = 0;
+    _reconnectionAttempts = 0;
+  }
+
+  void _attemptReconnection() {
+    if (_reconnectionAttempts >= maxReconnectionAttempts) {
+      print('${DateTime.now()} Max reconnection attempts reached');
+      return;
+    }
+
+    _reconnectionAttempts++;
+    _updateConnectionState(BleConnectionState.reconnecting);
+    
+    reconnectionTimer?.cancel();
+    reconnectionTimer = Timer(
+      Duration(seconds: reconnectionDelaySeconds * _reconnectionAttempts),
+      () async {
+        try {
+          print('${DateTime.now()} Reconnection attempt $_reconnectionAttempts');
+          
+          // try to reconnect to last device
+          if (pairedGlasses.isNotEmpty) {
+            final lastDevice = pairedGlasses.first;
+            final deviceName = "Pair_${lastDevice['channelNumber']}";
+            await connectToGlasses(deviceName);
+          }
+        } catch (e) {
+          print('${DateTime.now()} Reconnection attempt failed: $e');
+          if (_reconnectionAttempts < maxReconnectionAttempts) {
+            _attemptReconnection();
+          }
+        }
+      },
+    );
+  }
+
+  void _showToast(String message) {
+    try {
+      Fluttertoast.showToast(
+        msg: message,
+        toastLength: Toast.LENGTH_SHORT,
+        gravity: ToastGravity.BOTTOM,
+      );
+    } catch (e) {
+      print('${DateTime.now()} Error showing toast: $e');
+    }
   }
 
   static Future<bool> requestList(

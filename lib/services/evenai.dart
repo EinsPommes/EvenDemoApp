@@ -8,6 +8,28 @@ import 'package:demo_ai_even/services/proto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
+import 'package:fluttertoast/fluttertoast.dart';
+
+// states for evenai operations
+enum EvenAIState {
+  idle,
+  starting,
+  recording,
+  processing,
+  sending,
+  error
+}
+
+class EvenAIError {
+  final String message;
+  final dynamic originalError;
+  final DateTime timestamp;
+  
+  EvenAIError(this.message, [this.originalError]) : timestamp = DateTime.now();
+  
+  @override
+  String toString() => 'EvenAIError: $message at $timestamp';
+}
 
 class EvenAI {
   static EvenAI? _instance;
@@ -31,9 +53,20 @@ class EvenAI {
   static List<String> sendReplys = [];
 
   Timer? _recordingTimer;
-  final int maxRecordingDuration = 30; // todo
+  final int maxRecordingDuration = 30;
 
-  static bool _isManual = false; 
+  static bool _isManual = false;
+  
+  // track state and errors
+  EvenAIState _currentState = EvenAIState.idle;
+  int _errorCount = 0;
+  static const int maxErrorCount = 3;
+  DateTime? _lastErrorTime;
+  
+  EvenAIState get currentState => _currentState;
+  
+  // callback for errors
+  Function(EvenAIError)? onError; 
 
   static set isRunning(bool value) {
     _isRunning = value;
@@ -67,41 +100,74 @@ class EvenAI {
   EvenAI._(); 
 
   void startListening() {
-    combinedText = '';
-    _eventSpeechRecognizeChannel.listen((event) {
-      var txt = event["script"] as String;
-      combinedText = txt;
-    }, onError: (error) {
-      print("Error in event: $error");
-    });
+    try {
+      combinedText = '';
+      _eventSpeechRecognizeChannel.listen((event) {
+        try {
+          if (event != null && event is Map && event.containsKey("script")) {
+            var txt = event["script"] as String;
+            combinedText = txt;
+            print('${DateTime.now()} Speech recognized: $txt');
+          } else {
+            print('${DateTime.now()} Invalid speech recognition event: $event');
+          }
+        } catch (e) {
+          _handleError(EvenAIError('Error processing speech event: $e', e));
+        }
+      }, onError: (error) {
+        _handleError(EvenAIError('Speech recognition stream error: $error', error));
+      });
+    } catch (e) {
+      _handleError(EvenAIError('Error starting speech listening: $e', e));
+    }
   }
 
   // receiving starting Even AI request from ble
   void toStartEvenAIByOS() async {
-    // restart to avoid ble data conflict
-    BleManager.get().startSendBeatHeart();
+    try {
+      _updateState(EvenAIState.starting);
+      
+      // don't start if already running
+      if (isRunning) {
+        print('${DateTime.now()} EvenAI already running, ignoring start request');
+        return;
+      }
 
-    startListening(); 
-    
-    // avoid duplicate ble command in short time, especially android
-    int currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - _lastStartTime < startTimeGap) {
-      return;
+      // restart to avoid ble data conflict
+      BleManager.get().startSendBeatHeart();
+
+      startListening(); 
+      
+      // avoid duplicate ble command in short time, especially android
+      int currentTime = DateTime.now().millisecondsSinceEpoch;
+      if (currentTime - _lastStartTime < startTimeGap) {
+        print('${DateTime.now()} EvenAI start request too soon, ignoring');
+        return;
+      }
+
+      _lastStartTime = currentTime;
+
+      clear();
+      isReceivingAudio = true;
+
+      isRunning = true;
+      _currentLine = 0;
+
+      await BleManager.invokeMethod("startEvenAI");
+      
+      await openEvenAIMic();
+
+      startRecordingTimer();
+      _updateState(EvenAIState.recording);
+      
+      _showToast('EvenAI started - speak now');
+      
+    } catch (e, stackTrace) {
+      _handleError(EvenAIError('Error starting EvenAI: $e', e));
+      _updateState(EvenAIState.error);
+      clear();
+      print('${DateTime.now()} Error in toStartEvenAIByOS: $e\n$stackTrace');
     }
-
-    _lastStartTime = currentTime;
-
-    clear();
-    isReceivingAudio = true;
-
-    isRunning = true;
-    _currentLine = 0;
-
-    await BleManager.invokeMethod("startEvenAI");
-    
-    await openEvenAIMic();
-
-    startRecordingTimer();
   }
 
   // Monitor the recording time to prevent the recording from ending when the OS exits unexpectedly
@@ -120,40 +186,65 @@ class EvenAI {
 
   // 收到眼镜端Even AI录音结束指令
   Future<void> recordOverByOS() async {
-    print('${DateTime.now()} EvenAI -------recordOverByOS-------');
+    try {
+      print('${DateTime.now()} EvenAI -------recordOverByOS-------');
+      _updateState(EvenAIState.processing);
 
-    int currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - _lastStopTime < stopTimeGap) {
-      return;
-    }
-    _lastStopTime = currentTime;
+      int currentTime = DateTime.now().millisecondsSinceEpoch;
+      if (currentTime - _lastStopTime < stopTimeGap) {
+        print('${DateTime.now()} EvenAI stop request too soon, ignoring');
+        return;
+      }
+      _lastStopTime = currentTime;
 
-    isReceivingAudio = false;
-    _recordingTimer?.cancel();
-    _recordingTimer = null;
+      isReceivingAudio = false;
+      _recordingTimer?.cancel();
+      _recordingTimer = null;
 
-    await BleManager.invokeMethod("stopEvenAI");
-    await Future.delayed(Duration(seconds: 2)); // todo
+      await BleManager.invokeMethod("stopEvenAI");
+      await Future.delayed(Duration(seconds: 2));
 
-    print("recordOverByOS----startSendReply---pre------combinedText-------*$combinedText*---");
+      print("recordOverByOS----startSendReply---pre------combinedText-------*$combinedText*---");
 
-    if (combinedText.isEmpty) {
+      if (combinedText.isEmpty) {
+        print('${DateTime.now()} No speech recognized');
+        updateDynamicText("No Speech Recognized");
+        isEvenAISyncing.value = false;
+        await startSendReply("No Speech Recognized");
+        _updateState(EvenAIState.idle);
+        return;
+      }
+
+      _showToast('Processing your request...');
       
-      updateDynamicText("No Speech Recognized");
-      isEvenAISyncing.value = false;
-      startSendReply("No Speech Recognized");
-      return;
+      try {
+        final apiService = ApiDeepSeekService();
+        String answer = await apiService.sendChatRequest(combinedText);
+      
+        print("recordOverByOS----startSendReply---combinedText-------*$combinedText*-----answer----$answer----");
+
+        updateDynamicText("$combinedText\n\n$answer");
+        isEvenAISyncing.value = false;
+        saveQuestionItem(combinedText, answer);
+        
+        _updateState(EvenAIState.sending);
+        await startSendReply(answer);
+        _updateState(EvenAIState.idle);
+        
+      } catch (e) {
+        _handleError(EvenAIError('Error getting AI response: $e', e));
+        updateDynamicText("$combinedText\n\nError: Unable to get AI response");
+        isEvenAISyncing.value = false;
+        await startSendReply("Sorry, I couldn't process your request. Please try again.");
+        _updateState(EvenAIState.error);
+      }
+      
+    } catch (e, stackTrace) {
+      _handleError(EvenAIError('Error in recordOverByOS: $e', e));
+      _updateState(EvenAIState.error);
+      clear();
+      print('${DateTime.now()} Error in recordOverByOS: $e\n$stackTrace');
     }
-
-    final apiService = ApiDeepSeekService();
-    String answer = await apiService.sendChatRequest(combinedText);
-  
-    print("recordOverByOS----startSendReply---combinedText-------*$combinedText*-----answer----$answer----");
-
-    updateDynamicText("$combinedText\n\n$answer");
-    isEvenAISyncing.value = false;
-    saveQuestionItem(combinedText, answer);
-    startSendReply(answer);
   }
 
   void saveQuestionItem(String title, String content) {
@@ -418,32 +509,84 @@ class EvenAI {
   }
 
   void clear() {
-    isReceivingAudio = false;
-    isRunning = false;
-    _isManual = false;
-    _currentLine = 0;
-    _recordingTimer?.cancel();
-    _recordingTimer = null;
-    _timer?.cancel();
-    _timer = null;
-    audioDataBuffer.clear();
-    audioDataBuffer = [];
-    audioData = null;
-    list = [];
-    sendReplys = [];
-    durationS = 0;
-    retryCount = 0;
+    try {
+      print('${DateTime.now()} EvenAI clearing state');
+      
+      isReceivingAudio = false;
+      isRunning = false;
+      _isManual = false;
+      _currentLine = 0;
+      
+      // stop timers
+      _recordingTimer?.cancel();
+      _recordingTimer = null;
+      _timer?.cancel();
+      _timer = null;
+      
+      // clear audio data
+      audioDataBuffer.clear();
+      audioDataBuffer = [];
+      audioData = null;
+      
+      // clear text data
+      list = [];
+      sendReplys = [];
+      combinedText = '';
+      
+      durationS = 0;
+      retryCount = 0;
+      
+      // reset state
+      _updateState(EvenAIState.idle);
+      _resetErrorTracking();
+      
+      // update UI
+      isEvenAISyncing.value = false;
+      updateDynamicText("Press and hold left TouchBar to engage Even AI.");
+      
+    } catch (e) {
+      print('${DateTime.now()} Error in clear(): $e');
+    }
   }
 
   Future openEvenAIMic() async {
-    final (micStartMs, isStartSucc) = await Proto.micOn(lr: "R"); 
-    print(
-        '${DateTime.now()} openEvenAIMic---isStartSucc----$isStartSucc----micStartMs---$micStartMs---');
+    int retryCount = 0;
+    const maxRetries = 3;
     
-    if (!isStartSucc && isReceivingAudio && isRunning) {
-      await Future.delayed(Duration(seconds: 1));
-      await openEvenAIMic();
+    while (retryCount < maxRetries) {
+      try {
+        final (micStartMs, isStartSucc) = await Proto.micOn(lr: "R"); 
+        print('${DateTime.now()} openEvenAIMic attempt ${retryCount + 1} - success: $isStartSucc, time: $micStartMs');
+        
+        if (isStartSucc) {
+          print('${DateTime.now()} Microphone opened successfully');
+          return;
+        }
+        
+        if (!isReceivingAudio || !isRunning) {
+          print('${DateTime.now()} EvenAI stopped, aborting mic opening');
+          return;
+        }
+        
+        retryCount++;
+        if (retryCount < maxRetries) {
+          print('${DateTime.now()} Microphone opening failed, retrying in 1 second...');
+          await Future.delayed(Duration(seconds: 1));
+        }
+        
+      } catch (e) {
+        retryCount++;
+        _handleError(EvenAIError('Error opening microphone (attempt $retryCount): $e', e));
+        
+        if (retryCount < maxRetries) {
+          await Future.delayed(Duration(seconds: 1));
+        }
+      }
     }
+    
+    // mic opening failed completely
+    _handleError(EvenAIError('Failed to open microphone after $maxRetries attempts'));
+    clear();
   }
 
   // Send text data to the glasses，including status information
@@ -477,6 +620,51 @@ class EvenAI {
 
   static void dispose() {
     _textStreamController.close();
+  }
+
+  // helper methods for state and error handling
+  void _updateState(EvenAIState newState) {
+    if (_currentState != newState) {
+      print('${DateTime.now()} EvenAI State changed: $_currentState -> $newState');
+      _currentState = newState;
+    }
+  }
+
+  void _handleError(EvenAIError error) {
+    print('${DateTime.now()} EvenAI Error: $error');
+    
+    _errorCount++;
+    _lastErrorTime = DateTime.now();
+    
+    // call error callback if set
+    onError?.call(error);
+    
+    // show user friendly error message
+    _showToast('Error: ${error.message}');
+    
+    // stop if too many errors
+    if (_errorCount >= maxErrorCount) {
+      print('${DateTime.now()} Too many EvenAI errors, stopping');
+      clear();
+      _showToast('EvenAI stopped due to multiple errors');
+    }
+  }
+
+  void _showToast(String message) {
+    try {
+      Fluttertoast.showToast(
+        msg: message,
+        toastLength: Toast.LENGTH_SHORT,
+        gravity: ToastGravity.BOTTOM,
+      );
+    } catch (e) {
+      print('${DateTime.now()} Error showing toast: $e');
+    }
+  }
+
+  void _resetErrorTracking() {
+    _errorCount = 0;
+    _lastErrorTime = null;
   }
 }
 

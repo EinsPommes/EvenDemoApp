@@ -17,15 +17,34 @@ class Proto {
   static Future<(int, bool)> micOn({
     String? lr,
   }) async {
-    var begin = Utils.getTimestampMs();
-    var data = Uint8List.fromList([0x0E, 0x01]);
-    var receive = await BleManager.request(data, lr: lr);
+    try {
+      var begin = Utils.getTimestampMs();
+      var data = Uint8List.fromList([0x0E, 0x01]);
+      
+      print('${DateTime.now()} Proto.micOn - sending command to $lr');
+      var receive = await BleManager.request(data, lr: lr, timeoutMs: 2000);
 
-    var end = Utils.getTimestampMs();
-    var startMic = (begin + ((end - begin) ~/ 2));
+      var end = Utils.getTimestampMs();
+      var startMic = (begin + ((end - begin) ~/ 2));
 
-    print("Proto---micOn---startMic---$startMic-------");
-    return (startMic, (!receive.isTimeout && receive.data[1] == 0xc9));
+      if (receive.isTimeout) {
+        print('${DateTime.now()} Proto.micOn - timeout');
+        return (startMic, false);
+      }
+
+      if (receive.data.isEmpty) {
+        print('${DateTime.now()} Proto.micOn - empty response');
+        return (startMic, false);
+      }
+
+      bool success = receive.data[1] == 0xc9;
+      print('${DateTime.now()} Proto.micOn - startMic: $startMic, success: $success, response: ${receive.data[1]}');
+      
+      return (startMic, success);
+    } catch (e) {
+      print('${DateTime.now()} Proto.micOn - error: $e');
+      return (0, false);
+    }
   }
 
   /// Even AI
@@ -37,76 +56,128 @@ class Proto {
       required int pos,
       required int current_page_num,
       required int max_page_num}) async {
-    var data = utf8.encode(text);
-    var syncSeq = _evenaiSeq & 0xff;
-
-    List<Uint8List> dataList = EvenaiProto.evenaiMultiPackListV2(0x4E,
-        data: data,
-        syncSeq: syncSeq,
-        newScreen: newScreen,
-        pos: pos,
-        current_page_num: current_page_num,
-        max_page_num: max_page_num);
-    _evenaiSeq++;
-
-    print(
-        '${DateTime.now()} proto--sendEvenAIData---text---$text---_evenaiSeq----$_evenaiSeq---newScreen---$newScreen---pos---$pos---current_page_num--$current_page_num---max_page_num--$max_page_num--dataList----$dataList---');
-
-    bool isSuccess = await BleManager.requestList(dataList,
-        lr: "L", timeoutMs: timeoutMs ?? 2000);
-
-    print(
-        '${DateTime.now()} sendEvenAIData-----isSuccess-----$isSuccess-------');
-    if (!isSuccess) {
-      print("${DateTime.now()} sendEvenAIData failed  L ");
-      return false;
-    } else {
-      isSuccess = await BleManager.requestList(dataList,
-          lr: "R", timeoutMs: timeoutMs ?? 2000);
-
-      if (!isSuccess) {
-        print("${DateTime.now()} sendEvenAIData failed  R ");
+    try {
+      // check input params
+      if (text.isEmpty) {
+        print('${DateTime.now()} sendEvenAIData - empty text provided');
         return false;
       }
+
+      if (current_page_num < 0 || max_page_num < 1 || current_page_num > max_page_num) {
+        print('${DateTime.now()} sendEvenAIData - invalid page numbers: current=$current_page_num, max=$max_page_num');
+        return false;
+      }
+
+      var data = utf8.encode(text);
+      var syncSeq = _evenaiSeq & 0xff;
+
+      List<Uint8List> dataList = EvenaiProto.evenaiMultiPackListV2(0x4E,
+          data: data,
+          syncSeq: syncSeq,
+          newScreen: newScreen,
+          pos: pos,
+          current_page_num: current_page_num,
+          max_page_num: max_page_num);
+      _evenaiSeq++;
+
+      print('${DateTime.now()} proto--sendEvenAIData---text length: ${text.length}---seq: $_evenaiSeq---newScreen: $newScreen---pages: $current_page_num/$max_page_num---packets: ${dataList.length}');
+
+      // make sure we're connected
+      if (!BleManager.isBothConnected()) {
+        print('${DateTime.now()} sendEvenAIData - not connected');
+        return false;
+      }
+
+      // send to left first
+      bool isSuccessL = await BleManager.requestList(dataList,
+          lr: "L", timeoutMs: timeoutMs ?? 2000);
+
+      if (!isSuccessL) {
+        print("${DateTime.now()} sendEvenAIData failed L");
+        return false;
+      }
+
+      // send to right
+      bool isSuccessR = await BleManager.requestList(dataList,
+          lr: "R", timeoutMs: timeoutMs ?? 2000);
+
+      if (!isSuccessR) {
+        print("${DateTime.now()} sendEvenAIData failed R");
+        return false;
+      }
+
+      print('${DateTime.now()} sendEvenAIData successful for both sides');
       return true;
+      
+    } catch (e) {
+      print('${DateTime.now()} sendEvenAIData error: $e');
+      return false;
     }
   }
 
   static int _beatHeartSeq = 0;
   static Future<bool> sendHeartBeat() async {
-    var length = 6;
-    var data = Uint8List.fromList([
-      0x25,
-      length & 0xff,
-      (length >> 8) & 0xff,
-      _beatHeartSeq % 0xff,
-      0x04,
-      _beatHeartSeq % 0xff //0xff,
-    ]);
-    _beatHeartSeq++;
+    try {
+      var length = 6;
+      var data = Uint8List.fromList([
+        0x25,
+        length & 0xff,
+        (length >> 8) & 0xff,
+        _beatHeartSeq % 0xff,
+        0x04,
+        _beatHeartSeq % 0xff
+      ]);
+      _beatHeartSeq++;
 
-    print('${DateTime.now()} sendHeartBeat--------data---$data--');
-    var ret = await BleManager.request(data, lr: "L", timeoutMs: 1500);
-
-    print('${DateTime.now()} sendHeartBeat----L----ret---${ret.data}--');
-    if (ret.isTimeout) {
-      print('${DateTime.now()} sendHeartBeat----L----time out--');
-      return false;
-    } else if (ret.data[0].toInt() == 0x25 &&
-        ret.data.length > 5 &&
-        ret.data[4].toInt() == 0x04) {
-      var retR = await BleManager.request(data, lr: "R", timeoutMs: 1500);
-      print('${DateTime.now()} sendHeartBeat----R----retR---${retR.data}--');
-      if (retR.isTimeout) {
-        return false;
-      } else if (retR.data[0].toInt() == 0x25 &&
-          retR.data.length > 5 &&
-          retR.data[4].toInt() == 0x04) {
-        return true;
-      } else {
+      print('${DateTime.now()} sendHeartBeat seq: $_beatHeartSeq');
+      
+      // make sure we're connected
+      if (!BleManager.isBothConnected()) {
+        print('${DateTime.now()} sendHeartBeat - not connected');
         return false;
       }
-    } else {
+
+      // send to left
+      var retL = await BleManager.request(data, lr: "L", timeoutMs: 1500);
+
+      if (retL.isTimeout) {
+        print('${DateTime.now()} sendHeartBeat L timeout');
+        return false;
+      }
+
+      if (retL.data.isEmpty || retL.data.length < 6) {
+        print('${DateTime.now()} sendHeartBeat L invalid response length: ${retL.data.length}');
+        return false;
+      }
+
+      if (retL.data[0].toInt() != 0x25 || retL.data[4].toInt() != 0x04) {
+        print('${DateTime.now()} sendHeartBeat L invalid response: cmd=${retL.data[0]}, status=${retL.data.length > 4 ? retL.data[4] : 'N/A'}');
+        return false;
+      }
+
+      // send to right
+      var retR = await BleManager.request(data, lr: "R", timeoutMs: 1500);
+      
+      if (retR.isTimeout) {
+        print('${DateTime.now()} sendHeartBeat R timeout');
+        return false;
+      }
+
+      if (retR.data.isEmpty || retR.data.length < 6) {
+        print('${DateTime.now()} sendHeartBeat R invalid response length: ${retR.data.length}');
+        return false;
+      }
+
+      if (retR.data[0].toInt() != 0x25 || retR.data[4].toInt() != 0x04) {
+        print('${DateTime.now()} sendHeartBeat R invalid response: cmd=${retR.data[0]}, status=${retR.data.length > 4 ? retR.data[4] : 'N/A'}');
+        return false;
+      }
+
+      print('${DateTime.now()} sendHeartBeat successful');
+      return true;
+      
+    } catch (e) {
+      print('${DateTime.now()} sendHeartBeat error: $e');
       return false;
     }
   }

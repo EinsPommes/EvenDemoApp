@@ -23,26 +23,100 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    BleManager.get().setMethodCallHandler();
-    BleManager.get().startListening();
-    BleManager.get().onStatusChanged = _refreshPage;
+    _initializeBluetooth();
+  }
+
+  void _initializeBluetooth() {
+    try {
+      BleManager.get().setMethodCallHandler();
+      BleManager.get().startListening();
+      BleManager.get().onStatusChanged = _refreshPage;
+      
+      // handle ble errors
+      BleManager.get().onError = (error) {
+        print('${DateTime.now()} BLE Error in HomePage: $error');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Bluetooth Error: ${error.message}'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+      };
+      
+      // handle evenai errors
+      EvenAI.get.onError = (error) {
+        print('${DateTime.now()} EvenAI Error in HomePage: $error');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('EvenAI Error: ${error.message}'),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+      };
+      
+    } catch (e) {
+      print('${DateTime.now()} Error initializing Bluetooth: $e');
+    }
   }
 
   void _refreshPage() => setState(() {});
 
   Future<void> _startScan() async {
-    setState(() => isScanning = true);
-    await BleManager.get().startScan();
-    scanTimer?.cancel();
-    scanTimer = Timer(15.seconds, () {
-      // todo
-      _stopScan();
-    });
+    try {
+      if (isScanning) {
+        print('${DateTime.now()} Scan already in progress');
+        return;
+      }
+
+      setState(() => isScanning = true);
+      await BleManager.get().startScan();
+      
+      scanTimer?.cancel();
+      scanTimer = Timer(15.seconds, () {
+        print('${DateTime.now()} Scan timeout, stopping scan');
+        _stopScan();
+      });
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Scanning for glasses...'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      print('${DateTime.now()} Error starting scan: $e');
+      setState(() => isScanning = false);
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error starting scan: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _stopScan() async {
-    if (isScanning) {
-      await BleManager.get().stopScan();
+    try {
+      if (isScanning) {
+        await BleManager.get().stopScan();
+        setState(() => isScanning = false);
+        scanTimer?.cancel();
+        scanTimer = null;
+        print('${DateTime.now()} Scan stopped');
+      }
+    } catch (e) {
+      print('${DateTime.now()} Error stopping scan: $e');
       setState(() => isScanning = false);
     }
   }
@@ -55,9 +129,32 @@ class _HomePageState extends State<HomePage> {
             final glasses = BleManager.get().getPairedGlasses()[index];
             return GestureDetector(
               onTap: () async {
-                String channelNumber = glasses['channelNumber']!;
-                await BleManager.get().connectToGlasses("Pair_$channelNumber");
-                _refreshPage();
+                try {
+                  String channelNumber = glasses['channelNumber']!;
+                  print('${DateTime.now()} Attempting to connect to Pair_$channelNumber');
+                  
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Connecting to glasses...'),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                  }
+                  
+                  await BleManager.get().connectToGlasses("Pair_$channelNumber");
+                  _refreshPage();
+                } catch (e) {
+                  print('${DateTime.now()} Error connecting to glasses: $e');
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Failed to connect: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
               },
               child: Container(
                 height: 72,
@@ -187,9 +284,20 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
-    scanTimer?.cancel();
-    isScanning = false;
-    BleManager.get().onStatusChanged = null;
+    try {
+      scanTimer?.cancel();
+      scanTimer = null;
+      isScanning = false;
+      
+      // cleanup callbacks
+      BleManager.get().onStatusChanged = null;
+      BleManager.get().onError = null;
+      EvenAI.get.onError = null;
+      
+      print('${DateTime.now()} HomePage disposed');
+    } catch (e) {
+      print('${DateTime.now()} Error in HomePage dispose: $e');
+    }
     super.dispose();
   }
 }
