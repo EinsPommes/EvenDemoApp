@@ -19,6 +19,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   Timer? scanTimer;
   bool isScanning = false;
+  bool batteryOptimizationEnabled = true;
 
   @override
   void initState() {
@@ -188,6 +189,32 @@ class _HomePageState extends State<HomePage> {
         appBar: AppBar(
           title: const Text('Even AI Demo'),
           actions: [
+            // battery optimization toggle
+            InkWell(
+              onTap: () {
+                setState(() {
+                  batteryOptimizationEnabled = !batteryOptimizationEnabled;
+                });
+                BleManager.setBatteryOptimizationMode(batteryOptimizationEnabled);
+                EvenAI.setBatteryOptimization(batteryOptimizationEnabled);
+                
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(batteryOptimizationEnabled 
+                      ? 'Battery optimization enabled' 
+                      : 'Battery optimization disabled'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              },
+              child: Padding(
+                padding: EdgeInsets.only(left: 8, top: 12, bottom: 14, right: 8),
+                child: Icon(
+                  batteryOptimizationEnabled ? Icons.battery_saver : Icons.battery_full,
+                  color: batteryOptimizationEnabled ? Colors.green : Colors.grey,
+                ),
+              ),
+            ),
             InkWell(
               onTap: () {
                 print("To Features Page...");

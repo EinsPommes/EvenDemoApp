@@ -78,6 +78,9 @@ class BleManager {
   DateTime? _lastSuccessfulConnection;
   int _consecutiveFailures = 0;
   
+  // battery optimization
+  static bool _batteryOptimizationMode = false;
+  
   BleConnectionState get connectionState => _connectionState;
 
   void _init() {}
@@ -186,7 +189,9 @@ class BleManager {
     beatHeartTimer?.cancel();
     beatHeartTimer = null;
 
-    beatHeartTimer = Timer.periodic(Duration(seconds: 8), (timer) async {
+    // dynamic heartbeat frequency based on battery mode
+    int heartbeatInterval = _batteryOptimizationMode ? 20 : 15; // 20s in battery mode, 15s normal
+    beatHeartTimer = Timer.periodic(Duration(seconds: heartbeatInterval), (timer) async {
       try {
         if (!isConnected) {
           print('${DateTime.now()} Stopping heartbeat - not connected');
@@ -659,6 +664,21 @@ class BleManager {
       print('${DateTime.now()} Error showing toast: $e');
     }
   }
+
+  // battery optimization methods
+  static void setBatteryOptimizationMode(bool enabled) {
+    _batteryOptimizationMode = enabled;
+    print('${DateTime.now()} BLE Battery optimization mode: $enabled');
+    
+    if (enabled) {
+      // restart heartbeat with new interval if connected
+      if (_instance?.isConnected == true) {
+        _instance?.startSendBeatHeart();
+      }
+    }
+  }
+
+  static bool get isBatteryOptimizationEnabled => _batteryOptimizationMode;
 
   static Future<bool> requestList(
     List<Uint8List> sendList, {

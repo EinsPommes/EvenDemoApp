@@ -66,7 +66,12 @@ class EvenAI {
   EvenAIState get currentState => _currentState;
   
   // callback for errors
-  Function(EvenAIError)? onError; 
+  Function(EvenAIError)? onError;
+  
+  // battery optimization settings
+  static bool _batteryOptimizationEnabled = true;
+  static int _displayTimeoutSeconds = 30; // auto-clear display after 30s
+  Timer? _displayTimeoutTimer; 
 
   static set isRunning(bool value) {
     _isRunning = value;
@@ -230,6 +235,9 @@ class EvenAI {
         _updateState(EvenAIState.sending);
         await startSendReply(answer);
         _updateState(EvenAIState.idle);
+        
+        // start display timeout to save battery
+        _startDisplayTimeout();
         
       } catch (e) {
         _handleError(EvenAIError('Error getting AI response: $e', e));
@@ -522,6 +530,8 @@ class EvenAI {
       _recordingTimer = null;
       _timer?.cancel();
       _timer = null;
+      _displayTimeoutTimer?.cancel();
+      _displayTimeoutTimer = null;
       
       // clear audio data
       audioDataBuffer.clear();
@@ -666,6 +676,41 @@ class EvenAI {
     _errorCount = 0;
     _lastErrorTime = null;
   }
+
+  // battery optimization methods
+  void _startDisplayTimeout() {
+    if (!_batteryOptimizationEnabled) return;
+    
+    _displayTimeoutTimer?.cancel();
+    _displayTimeoutTimer = Timer(Duration(seconds: _displayTimeoutSeconds), () {
+      print('${DateTime.now()} Display timeout - clearing glasses display to save battery');
+      _clearGlassesDisplay();
+    });
+  }
+
+  void _clearGlassesDisplay() async {
+    try {
+      // send empty text to clear display
+      await Proto.sendEvenAIData("",
+          newScreen: 0x01,
+          pos: 0,
+          current_page_num: 1,
+          max_page_num: 1);
+      print('${DateTime.now()} Glasses display cleared for battery saving');
+    } catch (e) {
+      print('${DateTime.now()} Error clearing display: $e');
+    }
+  }
+
+  static void setBatteryOptimization(bool enabled, {int? timeoutSeconds}) {
+    _batteryOptimizationEnabled = enabled;
+    if (timeoutSeconds != null) {
+      _displayTimeoutSeconds = timeoutSeconds;
+    }
+    print('${DateTime.now()} Battery optimization: $enabled, timeout: ${_displayTimeoutSeconds}s');
+  }
+
+  static bool get isBatteryOptimizationEnabled => _batteryOptimizationEnabled;
 }
 
 extension EvenAIDataMethod on EvenAI {

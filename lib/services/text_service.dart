@@ -85,7 +85,7 @@ class TextService {
 
   Future updateReplyToOSByTimer() async {
     if (!isRunning) return;
-    int interval = 8; // The paging interval can be customized
+    int interval = 12; // increased interval to save battery (was 8s)
    
     _timer?.cancel();
     _timer = Timer.periodic(Duration(seconds: interval), (timer) async {
